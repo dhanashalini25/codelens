@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests -q
+
+      - name: End-to-end demo
+        run: |
+          python demo/make_demo_repo.py /tmp/codelens-demo
+          python -m codelens.cli index /tmp/codelens-demo
+          python -m codelens.cli review /tmp/codelens-demo --json
+
+      - name: CodeLens reviews its own diff
+        run: |
+          python -m codelens.cli index .
+          python -m codelens.cli review . --base origin/main --head HEAD || true

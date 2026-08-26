@@ -1,0 +1,106 @@
+# Run CodeLens on every pull request and post the findings as a comment.
+#
+# Set CODELENS_LLM_API_KEY in the repository secrets to enable the AI pass.
+# Without it the job still runs and reports the static findings.
+name: CodeLens review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Three pushes in a row should produce one review, not three. Cancels any
+# in-flight review for this PR when a new commit arrives.
+concurrency:
+  group: codelens-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # CodeLens needs history to diff against the base
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CodeLens
+        run: pip install -r requirements.txt
+
+      - name: Index the repository
+        run: python -m codelens.cli index .
+
+      - name: Review the pull request
+        env:
+          CODELENS_LLM_PROVIDER: ${{ secrets.CODELENS_LLM_API_KEY && 'groq' || 'mock' }}
+          CODELENS_LLM_API_KEY: ${{ secrets.CODELENS_LLM_API_KEY }}
+          # Providers decommission models without warning - Groq retired
+          # llama-3.3-70b-versatile while this project was being built, and the
+          # only symptom was a 400 with an empty body. Overriding the model is
+          # a repository variable, so recovering is one command and no code
+          # change:  gh variable set CODELENS_LLM_MODEL --body "<model-id>"
+          CODELENS_LLM_MODEL: ${{ vars.CODELENS_LLM_MODEL || 'openai/gpt-oss-120b' }}
+        run: |
+          python -m codelens.cli review . \
+            --base origin/${{ github.base_ref }} \
+            --head HEAD \
+            --json > review.json
+          python - <<'PY' > review.md
+          import json
+          data = json.load(open("review.json"))
+          counts = data["counts"]
+          icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+          print("## CodeLens review\n")
+          print(f"{data['summary']}\n")
+          if not data["findings"]:
+              print("No findings.")
+          for f in data["findings"]:
+              icon = icons.get(f["severity"], "•")
+              print(f"{icon} **{f['severity']}** `{f['file']}:{f['line']}` — {f['title']}  ")
+              if f["detail"]:
+                  print(f"    {f['detail']}  ")
+              if f["suggestion"]:
+                  print(f"    _Fix: {f['suggestion']}_  ")
+              print()
+          PY
+
+      # Always publish to the run summary. This needs no permissions, so it
+      # works on pull requests from forks - where GITHUB_TOKEN is read-only
+      # and the comment step below cannot post.
+      - name: Publish to the run summary
+        run: cat review.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on the pull request
+        continue-on-error: true   # read-only token on fork PRs; summary above still has it
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('review.md', 'utf8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      # Read the review we already ran rather than reviewing again: a second
+      # run would spend another LLM call and, without the provider env set,
+      # would silently only see the static findings.
+      - name: Fail on critical findings
+        run: |
+          python - <<'PY'
+          import json, sys
+          findings = json.load(open("review.json"))["findings"]
+          critical = [f for f in findings if f["severity"] == "critical"]
+          for f in critical:
+              print(f"::error file={f['file']},line={f['line']}::{f['title']}")
+          sys.exit(1 if critical else 0)
+          PY
